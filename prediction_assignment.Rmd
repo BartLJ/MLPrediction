@@ -1,7 +1,7 @@
 ---
-title: "Prediction Assignment"
+title: "Coursera Data Science - Machine Learning Prediction Assignment"
 author: "Bart Lemmens"
-date: "2 Oct 2016"
+date: "3 Oct 2016"
 output: html_document
 ---
 
