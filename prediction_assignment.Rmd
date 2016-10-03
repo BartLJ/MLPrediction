@@ -1,0 +1,249 @@
+---
+title: "Prediction Assignment"
+author: "Bart Lemmens"
+date: "2 Oct 2016"
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, results = "markup", cache = TRUE, fig.height=6, fig.width=6, fig.align="center",fig.pos='H')
+library(caret)
+library(randomForest)
+library(gbm)
+library(survival)
+library(splines)
+```
+
+```{r parallelcomputing, echo=FALSE}
+library(doMC)
+registerDoMC(cores = 6)
+```
+
+## Background
+
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it.
+
+In this project, we will use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+## Executive Summary
+
+In this report, we try to predict the manner in which the test participants did the exercise. This is the "classe" variable in the training set. Feature selection shows us that the data from the accelerometers can not be reduced to a few important predictors.
+
+Because of the high number of predictors and the multi-class classification problem, we immediately choose for more complex algorithms like Random Forest (RF) and Stochastic Gradient Boosted Trees (GBM), respectively using a subset of the 15 most important predictors and with all basic features.
+For the RF models we use Out-of-Bag error rate estimates to tune the models for the *mtry* model parameter. For the GBM models we use 5-fold cross-validation accuracy to tune the models for the model parameters *interaction depth* and *number of trees*.
+
+The error rate of a prediction with these tuned models on a validation set, confirms that the OOB and cross-validation error rates of the models give us an unbaised estimate.  
+We decide to make the final prediction on our test set with the best model, the GBM model based on all basic features, although the other models predict the same outcome.
+
+## Data Source
+
+For this data analysis and prediction, we use the Weight Lifting Exercise Dataset available on  http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises.
+
+```{r dataloading}
+training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                     na.strings=c("","NA","#DIV/0!"))
+testing <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                    na.strings=c("","NA","#DIV/0!"))
+```
+
+## Data Exploration
+
+As both the training and test set contain the user name, timestamps and window number, it's trivial to create a full decision tree using (a subset of) these features to predict the outcome *classe* with 100% accuracy. Therefore, to be able to generalize the predictions to samples of unseen time windows and unknown persons, we assume that the first 7 features should not be used in our model.
+
+As the 20 test samples are independent samples without any context, we can not use the windowing approach taken by the original researchers, as described in http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf.
+Therefore, the derived features, which are by the way unavailable for the majority of the samples, can also not be used in our model.
+
+```{r featureremoval}
+# remove first 7 columns
+badCols <- 1:7
+# remove summary columns (for which at least 90% of the values are NA)
+badCols <- union(badCols,
+                 unname(which(apply(training, 2, function(x) {sum(is.na(x))})
+                              > dim(training)[1]*.9)))
+# finally we keep 53 columns for 52 features and the outcome
+training <- training[,-badCols]
+testing <- testing[,-badCols]
+```
+
+```{r validationset}
+set.seed(1234)
+inSample <- createDataPartition(training$roll_belt, p = .8)[[1]]
+trainingSet <- training[inSample,]
+validationSet <- training[-inSample,]
+```
+
+## Feature Selection
+
+For the remaining 52 features, we'd like to know whether we can consider only a subset in our model without sacrificing too much accuracy.
+
+PCA tells us that we need at least 25 (linear combinations of) features to explain at least 95% of the variance. This does not look promising to reduce the number of features in our model.
+
+```{r pca}
+preProcess(trainingSet[,1:52], method = c("center","scale", "pca"))
+```
+
+We'll now use backward recusive feature selection (RFE) with random forests with 5-fold cross-validation to get an idea of how the cross-validated accuracy evolves with an increasing number of predictors.
+
+```{r rfe}
+set.seed(1234)
+seeds <- vector(mode = "list", length = 6) #length is = (n_repeats*nresampling)+1
+for(i in 1:5) seeds[[i]]<- sample.int(n=1000, 10) #(10 is the number of tuning parameter, sizes for rfe)
+seeds[[6]]<-sample.int(1000, 1)#for the last model
+rfecontrol <- rfeControl(functions=rfFuncs, method="cv", number=5, seeds=seeds)
+m_rfe <- rfe(trainingSet[,1:52], trainingSet[,53],
+             sizes = c(3,4,6,8,10,12,15,20,35), rfeControl = rfecontrol)
+plot(m_rfe, type = c("o","g"))
+```
+
+This graph shows us that adding more features will increase the cross-validated accuracy.
+However, without model tuning, we can already obtain about 99% accuracy with the 15 most important features, which are shown below.
+
+```{r rfefeatures}
+cols <- m_rfe$optVariables[1:15]
+print(cols)
+```
+
+## Model Building
+
+Because of the nature of the problem, where we have a lot of continuous features for which a (generalized) linear model will have difficulties predicting the multi-class outcome, we will evaluate tree-based models that are able to capture non-linearities more easily than a linear model: a random forest and stochastic gradient boosted trees.  
+We will then evaluate these models on our validation set.
+
+### Random Forest
+
+We use the caret train method to tune a Random Forest model for the *mtry* model parameter, using the OOB error estimate as an unbiased estimate of the test error. We search around the default for *mtry* for a classification problem is *floor(sqrt(n))* with *n* the number of predictors (*n*=15, *mtry* = 3).
+
+```{r rf}
+set.seed(2113)
+seeds <- vector(mode = "list", length = 2) #length is = (n_repeats*nresampling)+1
+for(i in 1:1) seeds[[i]]<- sample.int(n=1000, 6) #(6 is the number of tuning parameter, mtry for rf)
+seeds[[2]]<-sample.int(1000, 1)#for the last model
+m_rf <- train(x = trainingSet[,cols], y = trainingSet$classe, method = "rf",
+              trControl = trainControl(method = "oob"),
+              tuneGrid = data.frame(mtry = c(2:7)))
+m_rf
+```
+
+The best model has an estimated OOB error rate of `r round(m_rf$finalModel$err.rate[m_rf$finalModel$ntree,1] * 100, 2)`% and the plot shows that the accuracy does not improve considerably after 100 trees.
+
+```{r rf_finalmodel}
+m_rf$finalModel
+plot(m_rf$finalModel)
+```
+
+### Stochastic Gradient Boosted Trees
+
+We use the caret train method to tune a Stochastic Gradient Boosted model for the *mtry* model parameter, using the OOB error estimate as an unbiased estimate of the test error. We search around the default for *mtry* for a classification problem, being *floor(sqrt(n))* with *n* the number of predictors (*n*=15, *mtry* = 3).
+
+```{r gbm}
+set.seed(2113)
+seeds <- vector(mode = "list", length = 6) #length is = (n_repeats*nresampling)+1
+for(i in 1:5) seeds[[i]]<- sample.int(n=1000, 30) #(30 is the number of tuning parameter combinations)
+seeds[[6]]<-sample.int(1000, 1)#for the last model
+
+gbmGrid <- expand.grid(interaction.depth = 4:6,
+                       n.trees = (1:10)*250,
+                       shrinkage = 0.1,
+                       n.minobsinnode = 20)
+m_gbm <- train(x = trainingSet[,cols], y = trainingSet$classe, method = "gbm",
+               distribution = "multinomial",
+               trControl = trainControl(method = "cv", number = 5),
+               tuneGrid = gbmGrid,
+               verbose = FALSE)
+m_gbm
+plot(m_gbm)
+```
+
+The best model has a cross-validated accuracy of `r round((m_gbm$results[rownames(m_gbm$bestTune),"Accuracy"])*100, 2)`% and error rate (1-Accuracy) of `r round((1-m_gbm$results[rownames(m_gbm$bestTune),"Accuracy"])*100, 2)`%.
+
+### Comparison with alternative models without feature selection
+
+Out of curiosity, we compare the 2 previous models with similar models using all 52 predictors.
+
+```{r rf_all, include=FALSE}
+set.seed(2113)
+seeds <- vector(mode = "list", length = 2) #length is = (n_repeats*nresampling)+1
+for(i in 1:1) seeds[[i]]<- sample.int(n=1000, 11) #(11 is the number of tuning parameter, mtry for rf)
+seeds[[2]]<-sample.int(1000, 1)#for the last model
+m_rf_all <- train(x = trainingSet[,names(trainingSet) != "classe"], y = trainingSet$classe,
+              method = "rf",
+              trControl = trainControl(method = "oob"),
+              tuneGrid = data.frame(mtry = c(2:12)))
+m_rf_all
+```
+
+```{r gbm_all, include=FALSE}
+set.seed(2113)
+seeds <- vector(mode = "list", length = 6) #length is = (n_repeats*nresampling)+1
+for(i in 1:5) seeds[[i]]<- sample.int(n=1000, 30) #(30 is the number of tuning parameter combinations)
+seeds[[6]]<-sample.int(1000, 1)#for the last model
+
+gbmGrid <- expand.grid(interaction.depth = 4:6,
+                       n.trees = (1:10)*250,
+                       shrinkage = 0.1,
+                       n.minobsinnode = 20)
+m_gbm_all <- train(x = trainingSet[,names(trainingSet) != "classe"], y = trainingSet$classe,
+               method = "gbm",
+               distribution = "multinomial",
+               trControl = trainControl(method = "cv", number = 5),
+               tuneGrid = gbmGrid,
+               verbose = FALSE)
+m_gbm_all
+plot(m_gbm_all)
+```
+
+```{r modelcomparison, echo=FALSE}
+rf_comp <- cbind(method = c(m_rf$method, m_rf_all$method),
+                 error.rate = c(m_rf$finalModel$err.rate[m_rf$finalModel$ntree],
+                                m_rf_all$finalModel$err.rate[m_rf_all$finalModel$ntree]),
+                 features = c(length(m_rf$finalModel$xNames),
+                              length(m_rf_all$finalModel$xNames)),
+                 rbind(m_rf$finalModel[c("ntree", "mtry")],
+                       m_rf_all$finalModel[c("ntree", "mtry")]))
+rf_comp
+gbm_comp <- cbind(method = c(m_gbm$method, m_gbm_all$method),
+                  error.rate = c(1-m_gbm$results[rownames(m_gbm$bestTune), "Accuracy"],
+                                 1-m_gbm_all$results[rownames(m_gbm_all$bestTune), "Accuracy"]),
+                  features = c(length(m_gbm$finalModel$xNames),
+                               length(m_gbm_all$finalModel$xNames)),
+                  rbind(m_gbm$finalModel[c("n.trees", "interaction.depth",
+                                           "shrinkage", "n.minobsinnode")],
+                        m_gbm_all$finalModel[c("n.trees", "interaction.depth",
+                                           "shrinkage", "n.minobsinnode")]))
+gbm_comp
+```
+
+## Model Validation (Out of Sample Error)
+
+We now validate these 4 models with the validation set.
+
+```{r modelvalidation}
+error_rf <- round(1 - confusionMatrix(predict(m_rf, validationSet[,cols]),
+                                       validationSet$classe)$overall["Accuracy"], 4)
+error_rf_all <- round(1 - confusionMatrix(predict(m_rf_all,
+                                                  validationSet[,names(validationSet) != "classe"]),
+                                          validationSet$classe)$overall["Accuracy"], 4)
+error_gbm <- round(1 - confusionMatrix(predict(m_gbm, validationSet[,cols]),
+                                       validationSet$classe)$overall["Accuracy"], 4)
+error_gbm_all <- round(1 - confusionMatrix(predict(m_gbm_all,
+                                                   validationSet[,names(validationSet) != "classe"]),
+                                           validationSet$classe)$overall["Accuracy"], 4)
+data.frame( model = c("rf.15", "rf.52", "gbm.15", "gbm.52"),
+            error.rate = c(error_rf, error_rf_all, error_gbm, error_gbm_all))
+```
+
+These error rates are very close to the estimated error rates above.  
+As the GBM model with 52 features has the lowest validation error, we will use this model for a final prediction on the test set.
+
+## Prediction
+
+The prediction on the test set using the GBM model with 52 features is shown below.  
+However, it seems that all 4 models agree on the outcome.  
+This means that the accuracy of the models using only the most important 15 features were good enough for this prediction.
+
+```{r prediction}
+p1 <- predict(m_rf, testing[,cols])
+p2 <- predict(m_rf_all, testing[,names(testing) != "classe"])
+p3 <- predict(m_gbm, testing[,cols])
+p4 <- predict(m_gbm_all, testing[,names(testing) != "classe"])
+unique(list(p1,p2,p3,p4))
+```
